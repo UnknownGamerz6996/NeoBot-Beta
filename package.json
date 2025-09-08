@@ -1,0 +1,39 @@
+{
+  "name": "neoprotect-advanced-bot",
+  "version": "2.0.0",
+  "description": "Advanced Discord bot for NeoProtect API integration with monitoring, analytics, and alerting",
+  "main": "src/index.js",
+  "scripts": {
+    "start": "node src/index.js",
+    "dev": "nodemon src/index.js",
+    "setup": "node src/utils/setup.js",
+    "deploy": "node src/utils/deploy-commands.js"
+  },
+  "dependencies": {
+    "discord.js": "^14.14.1",
+    "axios": "^1.6.2",
+    "dotenv": "^16.3.1",
+    "winston": "^3.11.0",
+    "node-cron": "^3.0.3",
+    "sqlite3": "^5.1.6"
+  },
+  "devDependencies": {
+    "nodemon": "^3.0.2"
+  },
+  "keywords": [
+    "discord",
+    "bot",
+    "neoprotect",
+    "ddos",
+    "monitoring",
+    "security",
+    "api",
+    "advanced"
+  ],
+  "author": "Your Name",
+  "license": "MIT",
+  "engines": {
+    "node": ">=18.0.0",
+    "npm": ">=8.0.0"
+  }
+}
