@@ -368,6 +368,15 @@ Logs are automatically rotated and managed. Check log files in the `logs/` direc
 4. Check Discord bot permissions
 5. Verify API connectivity
 
+## Planned Features
+
+Here are some features and improvements planned for future releases:
+
+- 🐞 **Bug Fixes** – Continuous patching and stability improvements  
+- ⚡ **Optimizations** – Performance tuning and reduced resource usage  
+- 📊 **Dashboard** – Web-based management dashboard for monitoring and configuration  
+
+
 ## Contributing
 
 1. Fork the repository
