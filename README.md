@@ -393,8 +393,7 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 - 📖 **Documentation**: Check this README and inline code comments
 - 🐛 **Bug Reports**: Open an issue on GitHub
 - 💡 **Feature Requests**: Open an issue with the enhancement label
-- 💬 **Community**: Join our Discord support server
 
 ---
 
-**Made with ❤️ for the DDoS protection community**
+**Made with ❤️ by UnknownGamerz for Vertuo Hosting**
