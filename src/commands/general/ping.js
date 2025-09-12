@@ -4,8 +4,11 @@ const config = require('../../../config');
 module.exports = {
     data: new SlashCommandBuilder()
         .setName('ping')
-        .setDescription('Check bot responsiveness and latency'),
-    cooldown: 3,
+        .setDescription('Check bot responsiveness and system status'),
+    
+    permissions: [],
+    guildOnly: false,
+    cooldown: 5,
     category: 'general',
 
     async execute(interaction) {
@@ -13,49 +16,48 @@ module.exports = {
         
         await interaction.deferReply();
         
-        const endTime = Date.now();
-        const responseTime = endTime - startTime;
-        const apiLatency = interaction.client.ws.ping;
-
-        // Test database connection
-        let dbLatency = 'Unknown';
+        const responseTime = Date.now() - startTime;
+        const apiLatency = Math.round(interaction.client.ws.ping);
+        
+        // Test database response time
+        const dbStart = Date.now();
+        let dbLatency = 'N/A';
         let dbStatus = '🔴 Error';
+        
         try {
-            const dbStart = Date.now();
-            await interaction.client.database.get('SELECT 1');
-            dbLatency = `${Date.now() - dbStart}ms`;
-            dbStatus = '🟢 Connected';
-        } catch (error) {
-            dbLatency = 'Failed';
-        }
-
-        // Test NeoProtect API connection
-        let apiStatus = '🔴 Unhealthy';
-        let apiResponseTime = 'Unknown';
-        const neoHealth = interaction.client.neoprotect.getHealthStatus();
-        if (neoHealth.isHealthy) {
-            apiStatus = '🟢 Healthy';
-            // Quick API test
-            try {
-                const apiStart = Date.now();
-                await interaction.client.neoprotect.getAttacks({ limit: 1 });
-                apiResponseTime = `${Date.now() - apiStart}ms`;
-            } catch (error) {
-                apiResponseTime = 'Failed';
-                apiStatus = '🟡 Limited';
+            if (interaction.client.database) {
+                await interaction.client.database.testConnection();
+                dbLatency = `${Date.now() - dbStart}ms`;
+                dbStatus = '🟢 Connected';
             }
+        } catch (error) {
+            dbLatency = `${Date.now() - dbStart}ms (Error)`;
         }
 
-        // Determine overall health color
-        let embedColor = config.ui.colors.success;
-        if (dbStatus.includes('Error') || apiStatus.includes('Unhealthy')) {
-            embedColor = config.ui.colors.error;
-        } else if (apiStatus.includes('Limited') || responseTime > 1000 || apiLatency > 200) {
-            embedColor = config.ui.colors.warning;
+        // Test NeoProtect API response time
+        const apiStart = Date.now();
+        let apiResponseTime = 'N/A';
+        let apiStatus = '🔴 Error';
+        
+        try {
+            if (interaction.client.neoprotect) {
+                await interaction.client.neoprotect.testConnection();
+                apiResponseTime = `${Date.now() - apiStart}ms`;
+                apiStatus = '🟢 Connected';
+            }
+        } catch (error) {
+            apiResponseTime = `${Date.now() - apiStart}ms (Error)`;
         }
+
+        // Measure event loop lag properly
+        const eventLoopLag = await this.measureEventLoopLag();
+
+        // Get memory usage
+        const memUsage = process.memoryUsage();
+        const memoryMB = (memUsage.heapUsed / 1024 / 1024).toFixed(2);
 
         const embed = new EmbedBuilder()
-            .setColor(embedColor)
+            .setColor(this.getStatusColor(responseTime, apiLatency, eventLoopLag))
             .setTitle(`${config.ui.emojis.info} Pong! 🏓`)
             .setDescription('Bot responsiveness and system status')
             .addFields([
@@ -75,17 +77,17 @@ module.exports = {
                         `**Discord:** 🟢 Connected`,
                         `**Database:** ${dbStatus}`,
                         `**NeoProtect API:** ${apiStatus}`,
-                        `**Monitoring:** ${interaction.client.monitoring?.getSystemStats().isRunning ? '🟢 Running' : '🔴 Stopped'}`
+                        `**Monitoring:** ${this.getMonitoringStatus(interaction.client)}`
                     ].join('\n'),
                     inline: true
                 },
                 {
                     name: '📊 Performance',
                     value: [
-                        `**Memory Usage:** ${(process.memoryUsage().heapUsed / 1024 / 1024).toFixed(2)}MB`,
+                        `**Memory Usage:** ${memoryMB}MB`,
                         `**Uptime:** ${this.formatUptime(process.uptime() * 1000)}`,
-                        `**CPU Usage:** ${process.cpuUsage().user}μs`,
-                        `**Event Loop Lag:** ${this.getEventLoopLag()}ms`
+                        `**Event Loop Lag:** ${eventLoopLag}ms`,
+                        `**Load Average:** ${this.getLoadAverage()}`
                     ].join('\n'),
                     inline: false
                 }
@@ -96,11 +98,12 @@ module.exports = {
                 iconURL: interaction.user.displayAvatarURL()
             });
 
-        // Add warning if performance is poor
-        if (responseTime > 2000 || apiLatency > 500) {
+        // Add performance warning if needed
+        const warnings = this.getPerformanceWarnings(responseTime, apiLatency, eventLoopLag, memoryMB);
+        if (warnings.length > 0) {
             embed.addFields({
-                name: '⚠️ Performance Warning',
-                value: 'High latency detected. This may indicate network issues or high server load.',
+                name: '⚠️ Performance Warnings',
+                value: warnings.join('\n'),
                 inline: false
             });
         }
@@ -108,6 +111,18 @@ module.exports = {
         await interaction.editReply({ embeds: [embed] });
     },
 
+    // Properly measure event loop lag
+    async measureEventLoopLag() {
+        return new Promise((resolve) => {
+            const start = process.hrtime.bigint();
+            setImmediate(() => {
+                const lag = Number(process.hrtime.bigint() - start) / 1000000;
+                resolve(lag.toFixed(2));
+            });
+        });
+    },
+
+    // Format uptime in a readable way
     formatUptime(ms) {
         const seconds = Math.floor(ms / 1000);
         const minutes = Math.floor(seconds / 60);
@@ -120,12 +135,71 @@ module.exports = {
         return `${seconds}s`;
     },
 
-    getEventLoopLag() {
-        const start = process.hrtime.bigint();
-        setImmediate(() => {
-            const lag = Number(process.hrtime.bigint() - start) / 1000000;
-            return lag.toFixed(2);
-        });
-        return '< 1'; // Simplified for this implementation
+    // Get load average (Unix systems)
+    getLoadAverage() {
+        try {
+            const loadAvg = require('os').loadavg();
+            return loadAvg[0].toFixed(2);
+        } catch (error) {
+            return 'N/A';
+        }
+    },
+
+    // Get monitoring system status
+    getMonitoringStatus(client) {
+        try {
+            if (client.monitoring && client.monitoring.isRunning) {
+                return '🟢 Running';
+            } else if (client.monitoring) {
+                return '🔴 Stopped';
+            } else {
+                return '⚪ Not Available';
+            }
+        } catch (error) {
+            return '🔴 Error';
+        }
+    },
+
+    // Determine status color based on performance metrics
+    getStatusColor(responseTime, apiLatency, eventLoopLag) {
+        const lagMs = parseFloat(eventLoopLag);
+        
+        // Red if any critical performance issues
+        if (responseTime > 3000 || apiLatency > 1000 || lagMs > 100) {
+            return config.ui.colors.error;
+        }
+        
+        // Yellow if moderate performance issues
+        if (responseTime > 1500 || apiLatency > 500 || lagMs > 50) {
+            return config.ui.colors.warning;
+        }
+        
+        // Green if everything looks good
+        return config.ui.colors.success;
+    },
+
+    // Get performance warnings
+    getPerformanceWarnings(responseTime, apiLatency, eventLoopLag, memoryMB) {
+        const warnings = [];
+        const lagMs = parseFloat(eventLoopLag);
+        const memoryThreshold = config.performance?.memoryThreshold || 512;
+        
+        if (responseTime > 2000) {
+            warnings.push('• High bot response time detected');
+        }
+        
+        if (apiLatency > 500) {
+            warnings.push('• High Discord API latency detected');
+        }
+        
+        if (lagMs > 50) {
+            warnings.push('• High event loop lag detected');
+        }
+        
+        if (parseFloat(memoryMB) > memoryThreshold * 0.8) {
+            warnings.push('• Memory usage approaching threshold');
+        }
+        
+        return warnings;
     }
 };

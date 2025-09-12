@@ -1,49 +1,58 @@
-const { Collection } = require('discord.js');
 const fs = require('fs');
 const path = require('path');
+const { Collection } = require('discord.js');
+const config = require('../../config');
 const logger = require('../utils/logger');
 const database = require('../utils/database');
-const config = require('../../config');
+const ErrorHandler = require('./errorHandler');
 
 class CommandHandler {
     constructor(client) {
         this.client = client;
         this.commands = new Collection();
         this.cooldowns = new Collection();
-        this.rateLimits = new Map();
+        this.rateLimits = new Collection();
+        this.commandStats = new Map();
+        
         this.loadCommands();
+        this.setupCleanupInterval();
     }
 
-    loadCommands() {
+    async loadCommands() {
         const commandsPath = path.join(__dirname, '../commands');
         
         if (!fs.existsSync(commandsPath)) {
+            logger.warn('Commands directory not found, creating...');
             fs.mkdirSync(commandsPath, { recursive: true });
-            logger.warn('Commands directory created');
             return;
         }
 
-        const commandFolders = fs.readdirSync(commandsPath).filter(folder => 
-            fs.statSync(path.join(commandsPath, folder)).isDirectory()
-        );
+        let loadedCount = 0;
+        const categories = fs.readdirSync(commandsPath);
 
-        for (const folder of commandFolders) {
-            const folderPath = path.join(commandsPath, folder);
-            const commandFiles = fs.readdirSync(folderPath).filter(file => 
+        for (const category of categories) {
+            const categoryPath = path.join(commandsPath, category);
+            
+            if (!fs.statSync(categoryPath).isDirectory()) continue;
+
+            const commandFiles = fs.readdirSync(categoryPath).filter(file => 
                 file.endsWith('.js')
             );
 
             for (const file of commandFiles) {
-                const filePath = path.join(folderPath, file);
+                const filePath = path.join(categoryPath, file);
                 
                 try {
+                    // Clear require cache to allow hot reloading
                     delete require.cache[require.resolve(filePath)];
                     const command = require(filePath);
                     
                     if (this.validateCommand(command)) {
-                        command.category = folder;
+                        command.category = category;
                         this.commands.set(command.data.name, command);
-                        logger.debug(`Loaded command: ${command.data.name} from ${folder}`);
+                        loadedCount++;
+                        
+                        logger.debug(`Loaded command: ${command.data.name} (${category})`);
                     } else {
                         logger.warn(`Invalid command structure: ${file}`);
                     }
@@ -53,284 +62,331 @@ class CommandHandler {
             }
         }
 
-        logger.info(`Loaded ${this.commands.size} commands from ${commandFolders.length} categories`);
+        logger.info(`Loaded ${loadedCount} commands from ${categories.length} categories`);
     }
 
     validateCommand(command) {
         return command 
-            && typeof command.execute === 'function'
             && command.data 
-            && command.data.name
-            && command.data.description;
+            && command.data.name 
+            && command.data.description
+            && typeof command.execute === 'function';
     }
 
     async handleInteraction(interaction) {
         if (!interaction.isChatInputCommand()) return;
 
         const command = this.commands.get(interaction.commandName);
+        
         if (!command) {
-            logger.warn(`Unknown command: ${interaction.commandName}`);
+            logger.warn(`Unknown command: ${interaction.commandName}`, {
+                userId: interaction.user.id,
+                guildId: interaction.guildId
+            });
             return;
         }
 
         try {
-            // Permission checks
-            const hasPermission = await this.checkPermissions(interaction, command);
-            if (!hasPermission) return;
-
-            // Rate limiting
-            const rateLimited = await this.checkRateLimit(interaction, command);
-            if (rateLimited) return;
-
-            // Cooldown checks
-            const onCooldown = this.checkCooldown(interaction, command);
-            if (onCooldown) return;
-
-            // Guild-only command check
-            if (command.guildOnly && !interaction.guild) {
-                await interaction.reply({
-                    content: '❌ This command can only be used in a server!',
-                    ephemeral: true
-                });
+            // Pre-execution checks
+            const checkResult = await this.performPreExecutionChecks(interaction, command);
+            if (!checkResult.canExecute) {
+                if (checkResult.response) {
+                    await interaction.reply(checkResult.response);
+                }
                 return;
             }
 
-            // Premium command check
-            if (command.premium && !await this.isPremiumGuild(interaction.guildId)) {
-                await interaction.reply({
-                    content: '⭐ This is a premium feature! Upgrade your server to access advanced commands.',
-                    ephemeral: true
-                });
-                return;
-            }
+            // Record command usage
+            await this.recordCommandUsage(interaction, command);
 
-            // Log command usage
-            logger.command(
-                command.data.name,
-                interaction.user.id,
-                interaction.guildId,
-                this.getCommandArgs(interaction)
-            );
+            // Execute command with timeout
+            const executionPromise = this.executeWithTimeout(command, interaction);
+            await executionPromise;
 
-            // Record usage metric
-            await database.recordMetric('command_usage', 1, {
-                command: command.data.name,
-                userId: interaction.user.id,
-                guildId: interaction.guildId,
-                category: command.category
-            });
-
-            // Execute command
-            await command.execute(interaction);
-
-            // Set cooldown
-            this.setCooldown(interaction, command);
+            // Record successful execution
+            await this.recordCommandSuccess(interaction, command);
 
         } catch (error) {
-            logger.error(`Error executing command ${command.data.name}`, error, {
-                userId: interaction.user.id,
-                guildId: interaction.guildId,
-                commandName: command.data.name
-            });
-
-            const errorMessage = this.getErrorMessage(error);
-            
-            if (interaction.deferred || interaction.replied) {
-                await interaction.followUp({
-                    content: errorMessage,
-                    ephemeral: true
-                });
-            } else {
-                await interaction.reply({
-                    content: errorMessage,
-                    ephemeral: true
-                });
-            }
-
-            // Record error metric
-            await database.recordMetric('command_errors', 1, {
-                command: command.data.name,
-                error: error.message,
-                userId: interaction.user.id,
-                guildId: interaction.guildId
-            });
+            // Handle command error
+            const errorId = await ErrorHandler.handleCommandError(interaction, command, error);
+            await this.recordCommandError(interaction, command, error, errorId);
         }
     }
 
-    async checkPermissions(interaction, command) {
+    async performPreExecutionChecks(interaction, command) {
+        // Check if bot has necessary permissions
+        const botPermissionsCheck = await this.checkBotPermissions(interaction, command);
+        if (!botPermissionsCheck.hasPermissions) {
+            return {
+                canExecute: false,
+                response: {
+                    content: `❌ I don't have the required permissions: ${botPermissionsCheck.missing.join(', ')}`,
+                    ephemeral: true
+                }
+            };
+        }
+
+        // Check user permissions
+        const userPermissionsCheck = await this.checkUserPermissions(interaction, command);
+        if (!userPermissionsCheck.hasPermissions) {
+            return {
+                canExecute: false,
+                response: {
+                    content: `❌ You don't have permission to use this command. Required: ${userPermissionsCheck.missing.join(', ')}`,
+                    ephemeral: true
+                }
+            };
+        }
+
+        // Check if command can be used in this context
+        if (command.guildOnly && !interaction.guildId) {
+            return {
+                canExecute: false,
+                response: {
+                    content: '❌ This command can only be used in servers.',
+                    ephemeral: true
+                }
+            };
+        }
+
+        // Check cooldowns
+        const cooldownCheck = this.checkCooldown(interaction, command);
+        if (!cooldownCheck.canExecute) {
+            return {
+                canExecute: false,
+                response: {
+                    content: `⏰ Command is on cooldown. Try again in ${Math.ceil(cooldownCheck.timeLeft / 1000)} seconds.`,
+                    ephemeral: true
+                }
+            };
+        }
+
+        // Check rate limits
+        const rateLimitCheck = this.checkRateLimit(interaction);
+        if (!rateLimitCheck.canExecute) {
+            return {
+                canExecute: false,
+                response: {
+                    content: `🚦 You're being rate limited. Try again in ${Math.ceil(rateLimitCheck.timeLeft / 1000)} seconds.`,
+                    ephemeral: true
+                }
+            };
+        }
+
+        return { canExecute: true };
+    }
+
+    async checkBotPermissions(interaction, command) {
+        if (!interaction.guild || !command.botPermissions) {
+            return { hasPermissions: true };
+        }
+
+        const botMember = interaction.guild.members.me;
+        const missing = command.botPermissions.filter(permission => 
+            !botMember.permissions.has(permission)
+        );
+
+        return {
+            hasPermissions: missing.length === 0,
+            missing
+        };
+    }
+
+    async checkUserPermissions(interaction, command) {
         // Admin override
         if (config.security.adminUserIds.includes(interaction.user.id)) {
-            return true;
+            return { hasPermissions: true };
         }
 
-        // Check required permissions
-        if (command.permissions && command.permissions.length > 0) {
-            const member = interaction.member;
-            if (!member) return false;
+        let missing = [];
 
-            const hasPermissions = command.permissions.every(permission => 
-                member.permissions.has(permission)
+        // Check Discord permissions
+        if (command.permissions && interaction.member) {
+            const discordMissing = command.permissions.filter(permission => 
+                !interaction.member.permissions.has(permission)
             );
+            missing = missing.concat(discordMissing);
+        }
 
-            if (!hasPermissions) {
-                await interaction.reply({
-                    content: `❌ You need the following permissions to use this command: ${command.permissions.join(', ')}`,
-                    ephemeral: true
-                });
-                return false;
+        // Check custom permissions
+        if (command.customPermissions && interaction.guildId) {
+            try {
+                const userPermissions = await database.getUserPermissions(
+                    interaction.guildId,
+                    interaction.user.id
+                );
+
+                const customMissing = command.customPermissions.filter(permission =>
+                    !userPermissions.includes(permission)
+                );
+                missing = missing.concat(customMissing);
+            } catch (error) {
+                logger.error('Failed to check custom permissions', error);
+                // Allow execution if we can't check permissions
             }
         }
 
-        // Check custom permissions from database
-        if (command.customPermissions) {
-            const userPermissions = await database.getUserPermissions(
-                interaction.guildId,
-                interaction.user.id
-            );
-
-            const hasCustomPermission = command.customPermissions.some(permission =>
-                userPermissions.includes(permission)
-            );
-
-            if (!hasCustomPermission) {
-                await interaction.reply({
-                    content: '❌ You don\'t have permission to use this command.',
-                    ephemeral: true
-                });
-                return false;
-            }
-        }
-
-        return true;
-    }
-
-    async checkRateLimit(interaction, command) {
-        const rateLimitKey = `${interaction.user.id}_${command.data.name}`;
-        const now = Date.now();
-        const windowMs = config.security.rateLimit.windowMs;
-        const maxRequests = command.rateLimit || config.security.rateLimit.max;
-
-        if (!this.rateLimits.has(rateLimitKey)) {
-            this.rateLimits.set(rateLimitKey, []);
-        }
-
-        const requests = this.rateLimits.get(rateLimitKey);
-        
-        // Remove old requests outside the window
-        const validRequests = requests.filter(timestamp => now - timestamp < windowMs);
-        this.rateLimits.set(rateLimitKey, validRequests);
-
-        if (validRequests.length >= maxRequests) {
-            const remainingTime = Math.ceil((validRequests[0] + windowMs - now) / 1000);
-            
-            await interaction.reply({
-                content: `⏰ Rate limit exceeded! Please wait ${remainingTime} seconds before using this command again.`,
-                ephemeral: true
-            });
-
-            logger.rateLimit(interaction.user.id, command.data.name, maxRequests - validRequests.length);
-            return true;
-        }
-
-        // Add current request
-        validRequests.push(now);
-        this.rateLimits.set(rateLimitKey, validRequests);
-
-        return false;
+        return {
+            hasPermissions: missing.length === 0,
+            missing
+        };
     }
 
     checkCooldown(interaction, command) {
-        if (!command.cooldown) return false;
+        if (!command.cooldown || command.cooldown <= 0) {
+            return { canExecute: true };
+        }
 
-        const cooldownKey = `${interaction.user.id}_${command.data.name}`;
+        const userId = interaction.user.id;
+        const commandName = command.data.name;
+        const key = `${userId}:${commandName}`;
+
+        if (!this.cooldowns.has(key)) {
+            this.cooldowns.set(key, Date.now() + (command.cooldown * 1000));
+            return { canExecute: true };
+        }
+
+        const expirationTime = this.cooldowns.get(key);
         const now = Date.now();
-        const cooldownAmount = command.cooldown * 1000;
 
-        if (this.cooldowns.has(cooldownKey)) {
-            const expirationTime = this.cooldowns.get(cooldownKey) + cooldownAmount;
-
-            if (now < expirationTime) {
-                const timeLeft = (expirationTime - now) / 1000;
-                interaction.reply({
-                    content: `⏰ Please wait ${timeLeft.toFixed(1)} more seconds before using \`${command.data.name}\` again.`,
-                    ephemeral: true
-                });
-                return true;
-            }
+        if (now < expirationTime) {
+            return {
+                canExecute: false,
+                timeLeft: expirationTime - now
+            };
         }
 
-        return false;
+        this.cooldowns.set(key, now + (command.cooldown * 1000));
+        return { canExecute: true };
     }
 
-    setCooldown(interaction, command) {
-        if (!command.cooldown) return;
+    checkRateLimit(interaction) {
+        const userId = interaction.user.id;
+        const now = Date.now();
+        const windowMs = config.security.rateLimitWindow;
+        const maxRequests = config.security.rateLimitMaxRequests;
 
-        const cooldownKey = `${interaction.user.id}_${command.data.name}`;
-        this.cooldowns.set(cooldownKey, Date.now());
+        if (!this.rateLimits.has(userId)) {
+            this.rateLimits.set(userId, {
+                count: 1,
+                resetTime: now + windowMs
+            });
+            return { canExecute: true };
+        }
 
-        // Auto-remove cooldown after expiration
-        setTimeout(() => {
-            this.cooldowns.delete(cooldownKey);
-        }, command.cooldown * 1000);
+        const userLimits = this.rateLimits.get(userId);
+
+        if (now > userLimits.resetTime) {
+            // Reset the rate limit window
+            userLimits.count = 1;
+            userLimits.resetTime = now + windowMs;
+            return { canExecute: true };
+        }
+
+        if (userLimits.count >= maxRequests) {
+            return {
+                canExecute: false,
+                timeLeft: userLimits.resetTime - now
+            };
+        }
+
+        userLimits.count++;
+        return { canExecute: true };
     }
 
-    async isPremiumGuild(guildId) {
-        if (!guildId) return false;
+    async executeWithTimeout(command, interaction) {
+        const timeout = command.timeout || config.performance.requestTimeout;
         
+        return Promise.race([
+            command.execute(interaction),
+            new Promise((_, reject) => {
+                setTimeout(() => {
+                    reject(new Error(`Command execution timeout (${timeout}ms)`));
+                }, timeout);
+            })
+        ]);
+    }
+
+    async recordCommandUsage(interaction, command) {
         try {
-            const guild = await database.getGuild(guildId);
-            return guild?.premium || false;
-        } catch (error) {
-            logger.error('Failed to check premium status', error);
-            return false;
-        }
-    }
-
-    getCommandArgs(interaction) {
-        const args = {};
-        
-        if (interaction.options) {
-            for (const option of interaction.options.data) {
-                args[option.name] = option.value;
+            const key = command.data.name;
+            
+            if (!this.commandStats.has(key)) {
+                this.commandStats.set(key, {
+                    uses: 0,
+                    errors: 0,
+                    totalTime: 0,
+                    avgTime: 0
+                });
             }
+
+            const stats = this.commandStats.get(key);
+            stats.uses++;
+            stats.lastUsed = Date.now();
+
+            // Record in database
+            await database.recordMetric('command_usage', 1, {
+                command: command.data.name,
+                category: command.category,
+                userId: interaction.user.id,
+                guildId: interaction.guildId,
+                timestamp: new Date().toISOString()
+            });
+
+        } catch (error) {
+            logger.error('Failed to record command usage', error);
         }
-        
-        return args;
     }
 
-    getErrorMessage(error) {
-        if (error.code === 'INTERACTION_TIMEOUT') {
-            return '⏰ The command took too long to respond. Please try again.';
+    async recordCommandSuccess(interaction, command) {
+        try {
+            const stats = this.commandStats.get(command.data.name);
+            if (stats) {
+                const executionTime = Date.now() - stats.lastUsed;
+                stats.totalTime += executionTime;
+                stats.avgTime = stats.totalTime / stats.uses;
+            }
+
+            logger.command(command.data.name, interaction.user.id, {
+                guildId: interaction.guildId,
+                success: true
+            });
+        } catch (error) {
+            logger.error('Failed to record command success', error);
         }
-        
-        if (error.code === 'MISSING_PERMISSIONS') {
-            return '❌ I don\'t have the required permissions to execute this command.';
-        }
-        
-        if (error.message.includes('Unknown interaction')) {
-            return '❌ This interaction has expired. Please try the command again.';
-        }
-        
-        if (config.isDevelopment) {
-            return `❌ An error occurred: ${error.message}`;
-        }
-        
-        return '❌ An unexpected error occurred. Please try again later.';
     }
 
-    // Command management methods
+    async recordCommandError(interaction, command, error, errorId) {
+        try {
+            const stats = this.commandStats.get(command.data.name);
+            if (stats) {
+                stats.errors++;
+            }
+
+            logger.command(command.data.name, interaction.user.id, {
+                guildId: interaction.guildId,
+                success: false,
+                error: error.message,
+                errorId
+            });
+        } catch (logError) {
+            logger.error('Failed to record command error', logError);
+        }
+    }
+
     reloadCommand(commandName) {
         const command = this.commands.get(commandName);
         if (!command) return false;
 
-        const commandPath = path.join(__dirname, '../commands', command.category, `${commandName}.js`);
-        
+        const category = command.category;
+        const commandPath = path.join(__dirname, '../commands', category, `${commandName}.js`);
+
         try {
             delete require.cache[require.resolve(commandPath)];
             const newCommand = require(commandPath);
             
             if (this.validateCommand(newCommand)) {
-                newCommand.category = command.category;
+                newCommand.category = category;
                 this.commands.set(commandName, newCommand);
                 logger.info(`Reloaded command: ${commandName}`);
                 return true;
@@ -338,7 +394,7 @@ class CommandHandler {
         } catch (error) {
             logger.error(`Failed to reload command ${commandName}`, error);
         }
-        
+
         return false;
     }
 
@@ -348,82 +404,50 @@ class CommandHandler {
         logger.info('All commands reloaded');
     }
 
-    getCommandsByCategory() {
-        const categories = {};
-        
-        for (const [name, command] of this.commands) {
-            if (!categories[command.category]) {
-                categories[command.category] = [];
-            }
-            categories[command.category].push(command);
-        }
-        
-        return categories;
-    }
-
     getCommandStats() {
+        const totalCommands = this.commands.size;
+        const totalUses = Array.from(this.commandStats.values())
+            .reduce((sum, stats) => sum + stats.uses, 0);
+        const totalErrors = Array.from(this.commandStats.values())
+            .reduce((sum, stats) => sum + stats.errors, 0);
+
         return {
-            totalCommands: this.commands.size,
-            categories: Object.keys(this.getCommandsByCategory()).length,
-            activeCooldowns: this.cooldowns.size,
-            activeRateLimits: this.rateLimits.size
+            totalCommands,
+            totalUses,
+            totalErrors,
+            successRate: totalUses > 0 ? ((totalUses - totalErrors) / totalUses * 100).toFixed(2) : 100,
+            topCommands: Array.from(this.commandStats.entries())
+                .map(([name, stats]) => ({ name, ...stats }))
+                .sort((a, b) => b.uses - a.uses)
+                .slice(0, 10)
         };
     }
 
-    // Cleanup methods
-    clearCooldowns() {
-        this.cooldowns.clear();
-        logger.debug('All cooldowns cleared');
+    setupCleanupInterval() {
+        // Clean up expired cooldowns and rate limits every 5 minutes
+        setInterval(() => {
+            this.cleanupExpiredData();
+        }, 300000);
     }
 
-    clearRateLimits() {
-        this.rateLimits.clear();
-        logger.debug('All rate limits cleared');
-    }
+    cleanupExpiredData() {
+        const now = Date.now();
 
-    // Utility methods for commands
-    async createStandardEmbed(interaction, options = {}) {
-        const { EmbedBuilder } = require('discord.js');
-        
-        return new EmbedBuilder()
-            .setColor(options.color || config.ui.colors.primary)
-            .setTimestamp()
-            .setFooter({
-                text: `Requested by ${interaction.user.username}`,
-                iconURL: interaction.user.displayAvatarURL()
-            });
-    }
-
-    async createErrorEmbed(message, details = null) {
-        const { EmbedBuilder } = require('discord.js');
-        
-        const embed = new EmbedBuilder()
-            .setColor(config.ui.colors.error)
-            .setTitle(`${config.ui.emojis.error} Error`)
-            .setDescription(message)
-            .setTimestamp();
-            
-        if (details) {
-            embed.addFields({ name: 'Details', value: details, inline: false });
+        // Clean up cooldowns
+        for (const [key, expiration] of this.cooldowns.entries()) {
+            if (now > expiration) {
+                this.cooldowns.delete(key);
+            }
         }
-        
-        return embed;
-    }
 
-    async createSuccessEmbed(message, details = null) {
-        const { EmbedBuilder } = require('discord.js');
-        
-        const embed = new EmbedBuilder()
-            .setColor(config.ui.colors.success)
-            .setTitle(`${config.ui.emojis.success} Success`)
-            .setDescription(message)
-            .setTimestamp();
-            
-        if (details) {
-            embed.addFields({ name: 'Details', value: details, inline: false });
+        // Clean up rate limits
+        for (const [userId, data] of this.rateLimits.entries()) {
+            if (now > data.resetTime) {
+                this.rateLimits.delete(userId);
+            }
         }
-        
-        return embed;
+
+        logger.debug(`Cleaned up expired cooldowns and rate limits`);
     }
 }
 
