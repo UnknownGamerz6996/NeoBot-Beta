@@ -1,7 +1,6 @@
 const winston = require('winston');
 const path = require('path');
 const fs = require('fs');
-const config = require('../../config');
 
 class Logger {
     constructor() {
@@ -17,6 +16,15 @@ class Logger {
     }
 
     createLogger() {
+        // Safely load config with fallbacks
+        let config;
+        try {
+            config = require('../../config');
+        } catch (error) {
+            console.warn('Config not available during logger initialization, using defaults');
+            config = this.getDefaultConfig();
+        }
+
         const logFormat = winston.format.combine(
             winston.format.timestamp({
                 format: 'YYYY-MM-DD HH:mm:ss'
@@ -54,38 +62,103 @@ class Logger {
 
         const transports = [];
 
-        // Console transport
-        if (config.logging.console.enabled) {
+        // Console transport - always enabled during development
+        const shouldEnableConsole = this.shouldEnableConsole(config);
+        if (shouldEnableConsole) {
             transports.push(new winston.transports.Console({
                 format: consoleFormat,
-                level: config.logging.level
+                level: this.getLogLevel(config)
             }));
         }
 
-        // File transport
-        if (config.logging.file.enabled) {
+        // File transport - always enabled
+        const shouldEnableFile = this.shouldEnableFile(config);
+        if (shouldEnableFile) {
             transports.push(new winston.transports.File({
                 filename: path.join(__dirname, '../../logs/error.log'),
                 level: 'error',
                 format: logFormat,
-                maxsize: config.logging.file.maxSize,
-                maxFiles: config.logging.file.maxFiles
+                maxsize: this.getMaxFileSize(config),
+                maxFiles: this.getMaxFiles(config)
             }));
 
             transports.push(new winston.transports.File({
                 filename: path.join(__dirname, '../../logs/combined.log'),
                 format: logFormat,
-                maxsize: config.logging.file.maxSize,
-                maxFiles: config.logging.file.maxFiles
+                maxsize: this.getMaxFileSize(config),
+                maxFiles: this.getMaxFiles(config)
             }));
         }
 
         return winston.createLogger({
-            level: config.logging.level,
+            level: this.getLogLevel(config),
             format: logFormat,
             transports,
             exitOnError: false
         });
+    }
+
+    // Safe config accessors with fallbacks
+    getDefaultConfig() {
+        return {
+            logging: {
+                level: process.env.LOG_LEVEL || 'info',
+                console: { enabled: true },
+                file: { 
+                    enabled: true,
+                    maxSize: 10485760,
+                    maxFiles: 5
+                }
+            }
+        };
+    }
+
+    shouldEnableConsole(config) {
+        // Check multiple possible config structures
+        if (config?.logging?.console?.enabled !== undefined) {
+            return config.logging.console.enabled;
+        }
+        // Fallback: enable console in development
+        return process.env.NODE_ENV !== 'production';
+    }
+
+    shouldEnableFile(config) {
+        // Check multiple possible config structures
+        if (config?.logging?.file?.enabled !== undefined) {
+            return config.logging.file.enabled;
+        }
+        // Fallback: always enable file logging
+        return true;
+    }
+
+    getLogLevel(config) {
+        // Try multiple config structures
+        if (config?.logging?.level) {
+            return config.logging.level;
+        }
+        return process.env.LOG_LEVEL || 'info';
+    }
+
+    getMaxFileSize(config) {
+        // Try multiple config structures
+        if (config?.logging?.file?.maxSize) {
+            return config.logging.file.maxSize;
+        }
+        if (config?.logging?.maxSize) {
+            return config.logging.maxSize;
+        }
+        return parseInt(process.env.LOG_FILE_MAX_SIZE) || 10485760; // 10MB
+    }
+
+    getMaxFiles(config) {
+        // Try multiple config structures
+        if (config?.logging?.file?.maxFiles) {
+            return config.logging.file.maxFiles;
+        }
+        if (config?.logging?.maxFiles) {
+            return config.logging.maxFiles;
+        }
+        return parseInt(process.env.LOG_MAX_FILES) || 5;
     }
 
     // Standard logging methods
@@ -115,13 +188,12 @@ class Logger {
     }
 
     // Specialized logging methods
-    command(commandName, userId, guildId, args = {}) {
+    command(commandName, userId, context = {}) {
         this.info('Command executed', {
             type: 'command',
             command: commandName,
             userId,
-            guildId,
-            args
+            ...context
         });
     }
 
@@ -154,8 +226,8 @@ class Logger {
         this.warn('Attack detected', {
             type: 'attack',
             attackId: attackData.id,
-            targetIp: attackData.dstAddress?.ipv4,
-            attackType: attackData.signatures?.[0]?.name,
+            targetIp: attackData.dstAddress?.ipv4 || attackData.target?.ip,
+            attackType: attackData.signatures?.[0]?.name || attackData.type,
             startedAt: attackData.startedAt
         });
     }
@@ -252,6 +324,15 @@ class Logger {
                 this.info(message.trim(), { type: 'http' });
             }
         };
+    }
+
+    // Test method to verify logger is working
+    test() {
+        this.debug('Logger test - debug level');
+        this.info('Logger test - info level');
+        this.warn('Logger test - warn level');
+        this.error('Logger test - error level');
+        console.log('✅ Logger test completed - check logs directory');
     }
 }
 

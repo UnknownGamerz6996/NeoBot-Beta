@@ -1,459 +1,604 @@
-const sqlite3 = require('sqlite3').verbose();
-const path = require('path');
-const fs = require('fs');
-const config = require('../../config');
+const { MongoClient, ObjectId } = require('mongodb');
 const logger = require('./logger');
 
-class DatabaseManager {
+class MongoDatabase {
     constructor() {
+        this.client = null;
         this.db = null;
-        this.isInitialized = false;
-        this.init();
+        this.isConnected = false;
+        
+        // Simple URL-based connection
+        this.connectionString = process.env.MONGODB_URL || 'mongodb://localhost:27017';
+        this.dbName = process.env.MONGODB_DATABASE || 'neoprotect_bot';
+        
+        // Simple connection options
+        this.options = {
+            maxPoolSize: 10,
+            serverSelectionTimeoutMS: 5000,
+            socketTimeoutMS: 45000,
+            retryWrites: true
+        };
+
+        // Auto-connect when instantiated
+        this.connect().catch(error => {
+            logger.error('Failed to auto-connect to MongoDB:', error);
+        });
     }
 
-    async init() {
+    async connect() {
+        if (this.isConnected) {
+            return true;
+        }
+
         try {
-            // Ensure database directory exists
-            const dbDir = path.dirname(config.database.path);
-            if (!fs.existsSync(dbDir)) {
-                fs.mkdirSync(dbDir, { recursive: true });
-            }
-
-            // Initialize database connection
-            this.db = new sqlite3.Database(config.database.path, (err) => {
-                if (err) {
-                    logger.error('Failed to connect to database', err);
-                    throw err;
-                }
-                logger.info('Connected to SQLite database');
-            });
-
-            // Enable foreign keys
-            await this.run('PRAGMA foreign_keys = ON');
+            logger.info(`🍃 Connecting to MongoDB: ${this.connectionString.replace(/\/\/.*@/, '//***:***@')}`);
             
-            // Create tables
-            await this.createTables();
+            this.client = new MongoClient(this.connectionString, this.options);
+            await this.client.connect();
             
-            this.isInitialized = true;
-            logger.info('Database initialized successfully');
+            this.db = this.client.db(this.dbName);
+            this.isConnected = true;
+            
+            // Test the connection
+            await this.db.admin().ping();
+            
+            logger.info(`✅ Connected to MongoDB database: ${this.dbName}`);
+            
+            // Create indexes
+            await this.createIndexes();
+            
+            return true;
         } catch (error) {
-            logger.error('Database initialization failed', error);
+            logger.error('❌ Failed to connect to MongoDB', error);
+            this.isConnected = false;
+            this.db = null;
+            this.client = null;
+            
+            // Helpful error messages
+            if (error.message.includes('ECONNREFUSED')) {
+                logger.error('💡 MongoDB server is not running or connection URL is incorrect');
+                logger.error('💡 Make sure your MONGODB_URL is correct in .env file');
+            }
+            
             throw error;
         }
     }
 
-    async createTables() {
-        const tables = [
-            // Guilds table
-            `CREATE TABLE IF NOT EXISTS guilds (
-                id TEXT PRIMARY KEY,
-                name TEXT NOT NULL,
-                prefix TEXT DEFAULT '!',
-                settings TEXT DEFAULT '{}',
-                premium BOOLEAN DEFAULT FALSE,
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-            )`,
-
-            // Monitored IPs table
-            `CREATE TABLE IF NOT EXISTS monitored_ips (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                guild_id TEXT NOT NULL,
-                channel_id TEXT NOT NULL,
-                ip_address TEXT NOT NULL,
-                alias TEXT,
-                last_attack_id TEXT,
-                alert_settings TEXT DEFAULT '{}',
-                created_by TEXT NOT NULL,
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                is_active BOOLEAN DEFAULT TRUE,
-                FOREIGN KEY (guild_id) REFERENCES guilds(id) ON DELETE CASCADE,
-                UNIQUE(guild_id, ip_address)
-            )`,
-
-            // Attack history table
-            `CREATE TABLE IF NOT EXISTS attack_history (
-                id TEXT PRIMARY KEY,
-                ip_address TEXT NOT NULL,
-                attack_type TEXT,
-                start_time DATETIME NOT NULL,
-                end_time DATETIME,
-                peak_bps INTEGER,
-                peak_pps INTEGER,
-                duration INTEGER,
-                status TEXT DEFAULT 'active',
-                raw_data TEXT,
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP
-            )`,
-
-            // Alert logs table
-            `CREATE TABLE IF NOT EXISTS alert_logs (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                guild_id TEXT NOT NULL,
-                channel_id TEXT NOT NULL,
-                ip_address TEXT NOT NULL,
-                attack_id TEXT NOT NULL,
-                message_id TEXT,
-                alert_type TEXT NOT NULL,
-                sent_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (guild_id) REFERENCES guilds(id) ON DELETE CASCADE,
-                FOREIGN KEY (attack_id) REFERENCES attack_history(id)
-            )`,
-
-            // User permissions table
-            `CREATE TABLE IF NOT EXISTS user_permissions (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                guild_id TEXT NOT NULL,
-                user_id TEXT NOT NULL,
-                permissions TEXT DEFAULT '[]',
-                granted_by TEXT NOT NULL,
-                granted_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                FOREIGN KEY (guild_id) REFERENCES guilds(id) ON DELETE CASCADE,
-                UNIQUE(guild_id, user_id)
-            )`,
-
-            // API usage statistics
-            `CREATE TABLE IF NOT EXISTS api_usage (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                endpoint TEXT NOT NULL,
-                method TEXT NOT NULL,
-                status_code INTEGER,
-                response_time INTEGER,
-                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP,
-                error_message TEXT
-            )`,
-
-            // Bot statistics
-            `CREATE TABLE IF NOT EXISTS bot_stats (
-                id INTEGER PRIMARY KEY AUTOINCREMENT,
-                metric_name TEXT NOT NULL,
-                metric_value REAL NOT NULL,
-                metadata TEXT DEFAULT '{}',
-                timestamp DATETIME DEFAULT CURRENT_TIMESTAMP
-            )`,
-
-            // Settings cache
-            `CREATE TABLE IF NOT EXISTS settings_cache (
-                key TEXT PRIMARY KEY,
-                value TEXT NOT NULL,
-                expires_at DATETIME,
-                created_at DATETIME DEFAULT CURRENT_TIMESTAMP,
-                updated_at DATETIME DEFAULT CURRENT_TIMESTAMP
-            )`
-        ];
-
-        for (const table of tables) {
-            await this.run(table);
+    async ensureConnection() {
+        if (!this.isConnected || !this.db) {
+            await this.connect();
         }
+        return this.isConnected;
+    }
 
-        // Create indexes for better performance
-        const indexes = [
-            'CREATE INDEX IF NOT EXISTS idx_monitored_ips_guild ON monitored_ips(guild_id)',
-            'CREATE INDEX IF NOT EXISTS idx_monitored_ips_active ON monitored_ips(is_active)',
-            'CREATE INDEX IF NOT EXISTS idx_attack_history_ip ON attack_history(ip_address)',
-            'CREATE INDEX IF NOT EXISTS idx_attack_history_time ON attack_history(start_time)',
-            'CREATE INDEX IF NOT EXISTS idx_alert_logs_guild ON alert_logs(guild_id)',
-            'CREATE INDEX IF NOT EXISTS idx_api_usage_time ON api_usage(timestamp)',
-            'CREATE INDEX IF NOT EXISTS idx_bot_stats_metric ON bot_stats(metric_name, timestamp)'
-        ];
-
-        for (const index of indexes) {
-            await this.run(index);
+    async createIndexes() {
+        try {
+            // Create indexes for better performance
+            await this.db.collection('guilds').createIndex({ guild_id: 1 }, { unique: true, background: true });
+            await this.db.collection('monitored_ips').createIndex({ guild_id: 1, ip_address: 1 }, { unique: true, background: true });
+            await this.db.collection('attack_history').createIndex({ attack_id: 1 }, { unique: true, background: true });
+            await this.db.collection('api_usage').createIndex({ timestamp: -1 }, { background: true });
+            await this.db.collection('bot_stats').createIndex({ metric_name: 1, timestamp: -1 }, { background: true });
+            
+            logger.debug('✅ Database indexes created');
+        } catch (error) {
+            logger.warn('Error creating indexes (this is usually okay):', error.message);
         }
-
-        logger.info('Database tables and indexes created successfully');
     }
 
-    // Promisified database methods
-    run(sql, params = []) {
-        return new Promise((resolve, reject) => {
-            const startTime = Date.now();
-            this.db.run(sql, params, function(err) {
-                const duration = Date.now() - startTime;
-                logger.database('run', 'general', duration, err);
-                
-                if (err) {
-                    reject(err);
-                } else {
-                    resolve({ id: this.lastID, changes: this.changes });
-                }
-            });
-        });
+    async disconnect() {
+        try {
+            if (this.client) {
+                await this.client.close();
+                this.isConnected = false;
+                this.db = null;
+                this.client = null;
+                logger.info('Disconnected from MongoDB');
+            }
+        } catch (error) {
+            logger.error('Error disconnecting from MongoDB', error);
+        }
     }
 
-    get(sql, params = []) {
-        return new Promise((resolve, reject) => {
-            const startTime = Date.now();
-            this.db.get(sql, params, (err, row) => {
-                const duration = Date.now() - startTime;
-                logger.database('get', 'general', duration, err);
-                
-                if (err) {
-                    reject(err);
-                } else {
-                    resolve(row);
-                }
-            });
-        });
-    }
-
-    all(sql, params = []) {
-        return new Promise((resolve, reject) => {
-            const startTime = Date.now();
-            this.db.all(sql, params, (err, rows) => {
-                const duration = Date.now() - startTime;
-                logger.database('all', 'general', duration, err);
-                
-                if (err) {
-                    reject(err);
-                } else {
-                    resolve(rows);
-                }
-            });
-        });
+    async testConnection() {
+        try {
+            await this.ensureConnection();
+            await this.db.admin().ping();
+            return true;
+        } catch (error) {
+            logger.error('Database connection test failed', error);
+            throw error;
+        }
     }
 
     // Guild management
     async getGuild(guildId) {
-        return await this.get('SELECT * FROM guilds WHERE id = ?', [guildId]);
-    }
-
-    async createGuild(guildId, name, settings = {}) {
-        return await this.run(
-            'INSERT OR REPLACE INTO guilds (id, name, settings) VALUES (?, ?, ?)',
-            [guildId, name, JSON.stringify(settings)]
-        );
-    }
-
-    async updateGuildSettings(guildId, settings) {
-        return await this.run(
-            'UPDATE guilds SET settings = ?, updated_at = CURRENT_TIMESTAMP WHERE id = ?',
-            [JSON.stringify(settings), guildId]
-        );
-    }
-
-    // Monitored IPs management
-    async getMonitoredIPs(guildId) {
-        return await this.all(
-            'SELECT * FROM monitored_ips WHERE guild_id = ? AND is_active = TRUE ORDER BY created_at DESC',
-            [guildId]
-        );
-    }
-
-    async addMonitoredIP(guildId, channelId, ipAddress, alias, createdBy, alertSettings = {}) {
-        return await this.run(
-            `INSERT INTO monitored_ips 
-             (guild_id, channel_id, ip_address, alias, created_by, alert_settings) 
-             VALUES (?, ?, ?, ?, ?, ?)`,
-            [guildId, channelId, ipAddress, alias, createdBy, JSON.stringify(alertSettings)]
-        );
-    }
-
-    async removeMonitoredIP(guildId, ipAddress) {
-        return await this.run(
-            'UPDATE monitored_ips SET is_active = FALSE, updated_at = CURRENT_TIMESTAMP WHERE guild_id = ? AND ip_address = ?',
-            [guildId, ipAddress]
-        );
-    }
-
-    async updateLastAttackId(guildId, ipAddress, attackId) {
-        return await this.run(
-            'UPDATE monitored_ips SET last_attack_id = ?, updated_at = CURRENT_TIMESTAMP WHERE guild_id = ? AND ip_address = ?',
-            [attackId, guildId, ipAddress]
-        );
-    }
-
-    async getMonitoredIP(guildId, ipAddress) {
-        return await this.get(
-            'SELECT * FROM monitored_ips WHERE guild_id = ? AND ip_address = ? AND is_active = TRUE',
-            [guildId, ipAddress]
-        );
-    }
-
-    // Attack history management
-    async saveAttack(attackData) {
-        return await this.run(
-            `INSERT OR REPLACE INTO attack_history 
-             (id, ip_address, attack_type, start_time, peak_bps, peak_pps, raw_data) 
-             VALUES (?, ?, ?, ?, ?, ?, ?)`,
-            [
-                attackData.id,
-                attackData.dstAddress?.ipv4,
-                attackData.signatures?.[0]?.name,
-                attackData.startedAt,
-                attackData.signatures?.[0]?.bpsPeak,
-                attackData.signatures?.[0]?.ppsPeak,
-                JSON.stringify(attackData)
-            ]
-        );
-    }
-
-    async getAttackHistory(ipAddress, limit = 10) {
-        return await this.all(
-            'SELECT * FROM attack_history WHERE ip_address = ? ORDER BY start_time DESC LIMIT ?',
-            [ipAddress, limit]
-        );
-    }
-
-    async getAttackById(attackId) {
-        return await this.get('SELECT * FROM attack_history WHERE id = ?', [attackId]);
-    }
-
-    // Alert logs
-    async logAlert(guildId, channelId, ipAddress, attackId, messageId, alertType) {
-        return await this.run(
-            'INSERT INTO alert_logs (guild_id, channel_id, ip_address, attack_id, message_id, alert_type) VALUES (?, ?, ?, ?, ?, ?)',
-            [guildId, channelId, ipAddress, attackId, messageId, alertType]
-        );
-    }
-
-    async getAlertHistory(guildId, limit = 50) {
-        return await this.all(
-            'SELECT * FROM alert_logs WHERE guild_id = ? ORDER BY sent_at DESC LIMIT ?',
-            [guildId, limit]
-        );
-    }
-
-    // User permissions
-    async getUserPermissions(guildId, userId) {
-        const result = await this.get(
-            'SELECT permissions FROM user_permissions WHERE guild_id = ? AND user_id = ?',
-            [guildId, userId]
-        );
-        return result ? JSON.parse(result.permissions) : [];
-    }
-
-    async setUserPermissions(guildId, userId, permissions, grantedBy) {
-        return await this.run(
-            `INSERT OR REPLACE INTO user_permissions 
-             (guild_id, user_id, permissions, granted_by, granted_at) 
-             VALUES (?, ?, ?, ?, CURRENT_TIMESTAMP)`,
-            [guildId, userId, JSON.stringify(permissions), grantedBy]
-        );
-    }
-
-    // API usage tracking
-    async logApiUsage(endpoint, method, statusCode, responseTime, errorMessage = null) {
-        return await this.run(
-            'INSERT INTO api_usage (endpoint, method, status_code, response_time, error_message) VALUES (?, ?, ?, ?, ?)',
-            [endpoint, method, statusCode, responseTime, errorMessage]
-        );
-    }
-
-    async getApiStats(hours = 24) {
-        return await this.all(
-            `SELECT endpoint, COUNT(*) as requests, AVG(response_time) as avg_response_time,
-             COUNT(CASE WHEN status_code >= 400 THEN 1 END) as errors
-             FROM api_usage 
-             WHERE timestamp > datetime('now', '-${hours} hours')
-             GROUP BY endpoint ORDER BY requests DESC`,
-            []
-        );
-    }
-
-    // Bot statistics
-    async recordMetric(metricName, value, metadata = {}) {
-        return await this.run(
-            'INSERT INTO bot_stats (metric_name, metric_value, metadata) VALUES (?, ?, ?)',
-            [metricName, value, JSON.stringify(metadata)]
-        );
-    }
-
-    async getMetrics(metricName, hours = 24) {
-        return await this.all(
-            'SELECT * FROM bot_stats WHERE metric_name = ? AND timestamp > datetime(\'now\', \'-? hours\') ORDER BY timestamp DESC',
-            [metricName, hours]
-        );
-    }
-
-    // Cache management
-    async setCache(key, value, expiresIn = null) {
-        const expiresAt = expiresIn ? new Date(Date.now() + expiresIn).toISOString() : null;
-        return await this.run(
-            'INSERT OR REPLACE INTO settings_cache (key, value, expires_at, updated_at) VALUES (?, ?, ?, CURRENT_TIMESTAMP)',
-            [key, JSON.stringify(value), expiresAt]
-        );
-    }
-
-    async getCache(key) {
-        const result = await this.get(
-            'SELECT value, expires_at FROM settings_cache WHERE key = ?',
-            [key]
-        );
-        
-        if (!result) return null;
-        
-        // Check if expired
-        if (result.expires_at && new Date(result.expires_at) < new Date()) {
-            await this.run('DELETE FROM settings_cache WHERE key = ?', [key]);
-            return null;
-        }
-        
-        return JSON.parse(result.value);
-    }
-
-    async clearExpiredCache() {
-        return await this.run('DELETE FROM settings_cache WHERE expires_at < datetime(\'now\')');
-    }
-
-    // Database maintenance
-    async vacuum() {
-        logger.info('Running database vacuum...');
-        return await this.run('VACUUM');
-    }
-
-    async getTableSizes() {
-        const tables = ['guilds', 'monitored_ips', 'attack_history', 'alert_logs', 'user_permissions', 'api_usage', 'bot_stats'];
-        const sizes = {};
-        
-        for (const table of tables) {
-            const result = await this.get(`SELECT COUNT(*) as count FROM ${table}`);
-            sizes[table] = result.count;
-        }
-        
-        return sizes;
-    }
-
-    // Backup functionality
-    async createBackup() {
         try {
-            const backupDir = path.join(__dirname, '../../backups');
-            if (!fs.existsSync(backupDir)) {
-                fs.mkdirSync(backupDir, { recursive: true });
-            }
-            
-            const timestamp = new Date().toISOString().replace(/[:.]/g, '-');
-            const backupPath = path.join(backupDir, `backup-${timestamp}.db`);
-            
-            // Simple file copy for SQLite
-            fs.copyFileSync(config.database.path, backupPath);
-            
-            logger.info(`Database backup created: ${backupPath}`);
-            return backupPath;
+            await this.ensureConnection();
+            return await this.db.collection('guilds').findOne({ guild_id: guildId });
         } catch (error) {
-            logger.error('Failed to create database backup', error);
+            logger.error('Error getting guild:', error);
             throw error;
         }
     }
 
-    // Close database connection
-    close() {
-        return new Promise((resolve) => {
-            if (this.db) {
-                this.db.close((err) => {
-                    if (err) {
-                        logger.error('Error closing database', err);
-                    } else {
-                        logger.info('Database connection closed');
+    async createGuild(guildId, name, settings = {}) {
+        try {
+            await this.ensureConnection();
+            const result = await this.db.collection('guilds').updateOne(
+                { guild_id: guildId },
+                {
+                    $set: {
+                        guild_id: guildId,
+                        name: name,
+                        settings: settings,
+                        updated_at: new Date()
+                    },
+                    $setOnInsert: {
+                        created_at: new Date(),
+                        premium: false
                     }
-                    resolve();
-                });
-            } else {
-                resolve();
+                },
+                { upsert: true }
+            );
+            logger.debug(`✅ Guild created/updated: ${name}`);
+            return result;
+        } catch (error) {
+            logger.error('Error creating guild:', error);
+            throw error;
+        }
+    }
+
+    async updateGuildSettings(guildId, settings) {
+        try {
+            await this.ensureConnection();
+            return await this.db.collection('guilds').updateOne(
+                { guild_id: guildId },
+                {
+                    $set: {
+                        settings: settings,
+                        updated_at: new Date()
+                    }
+                }
+            );
+        } catch (error) {
+            logger.error('Error updating guild settings:', error);
+            throw error;
+        }
+    }
+
+    // Monitored IPs management
+    async getMonitoredIPs(guildId) {
+        try {
+            await this.ensureConnection();
+            return await this.db.collection('monitored_ips')
+                .find({ guild_id: guildId, is_active: true })
+                .sort({ created_at: -1 })
+                .toArray();
+        } catch (error) {
+            logger.error('Error getting monitored IPs:', error);
+            throw error;
+        }
+    }
+
+    async addMonitoredIP(guildId, channelId, ipAddress, alias, createdBy, alertSettings = {}) {
+        try {
+            await this.ensureConnection();
+            
+            const monitor = {
+                guild_id: guildId,
+                channel_id: channelId,
+                ip_address: ipAddress,
+                alias: alias,
+                created_by: createdBy,
+                alert_settings: alertSettings,
+                last_attack_id: null,
+                last_attack_time: null,
+                total_attacks: 0,
+                is_active: true,
+                created_at: new Date(),
+                updated_at: new Date()
+            };
+
+            const result = await this.db.collection('monitored_ips').insertOne(monitor);
+            return { id: result.insertedId, ...monitor };
+        } catch (error) {
+            if (error.code === 11000) {
+                throw new Error('IP address is already being monitored in this server');
             }
-        });
+            logger.error('Error adding monitored IP:', error);
+            throw error;
+        }
+    }
+
+    async removeMonitoredIP(guildId, ipAddress) {
+        try {
+            await this.ensureConnection();
+            return await this.db.collection('monitored_ips').updateOne(
+                { guild_id: guildId, ip_address: ipAddress },
+                {
+                    $set: {
+                        is_active: false,
+                        updated_at: new Date()
+                    }
+                }
+            );
+        } catch (error) {
+            logger.error('Error removing monitored IP:', error);
+            throw error;
+        }
+    }
+
+    async updateMonitor(monitorId, updates) {
+        try {
+            await this.ensureConnection();
+            return await this.db.collection('monitored_ips').updateOne(
+                { _id: new ObjectId(monitorId) },
+                {
+                    $set: {
+                        ...updates,
+                        updated_at: new Date()
+                    }
+                }
+            );
+        } catch (error) {
+            logger.error('Error updating monitor:', error);
+            throw error;
+        }
+    }
+
+    async getMonitoredIP(guildId, ipAddress) {
+        try {
+            await this.ensureConnection();
+            return await this.db.collection('monitored_ips').findOne({
+                guild_id: guildId,
+                ip_address: ipAddress,
+                is_active: true
+            });
+        } catch (error) {
+            logger.error('Error getting monitored IP:', error);
+            throw error;
+        }
+    }
+
+    async getAllActiveMonitors() {
+        try {
+            await this.ensureConnection();
+            return await this.db.collection('monitored_ips')
+                .find({ is_active: true })
+                .sort({ created_at: -1 })
+                .toArray();
+        } catch (error) {
+            logger.error('Error getting all active monitors:', error);
+            return [];
+        }
+    }
+
+    // API Usage logging
+    async logApiUsage(endpoint, method, statusCode, responseTime, errorMessage = null) {
+        try {
+            await this.ensureConnection();
+            const usage = {
+                endpoint: endpoint,
+                method: method,
+                status_code: statusCode,
+                response_time: responseTime,
+                error_message: errorMessage,
+                timestamp: new Date()
+            };
+
+            await this.db.collection('api_usage').insertOne(usage);
+        } catch (error) {
+            logger.warn('Failed to log API usage:', error.message);
+        }
+    }
+
+    // Metrics and statistics
+    async recordMetric(metricName, value, metadata = {}) {
+        try {
+            await this.ensureConnection();
+            const metric = {
+                metric_name: metricName,
+                metric_value: value,
+                metadata: metadata,
+                timestamp: new Date()
+            };
+
+            await this.db.collection('bot_stats').insertOne(metric);
+        } catch (error) {
+            logger.warn('Failed to record metric:', error.message);
+        }
+    }
+
+    async getMetrics(metricName, hoursBack = 24) {
+        try {
+            await this.ensureConnection();
+            const cutoffTime = new Date(Date.now() - (hoursBack * 60 * 60 * 1000));
+            
+            return await this.db.collection('bot_stats')
+                .find({
+                    metric_name: metricName,
+                    timestamp: { $gte: cutoffTime }
+                })
+                .sort({ timestamp: -1 })
+                .toArray();
+        } catch (error) {
+            logger.error('Error getting metrics:', error);
+            return [];
+        }
+    }
+
+    // Attack history
+    async saveAttack(attackData) {
+        try {
+            await this.ensureConnection();
+            const attack = {
+                attack_id: attackData.id,
+                ip_address: attackData.dstAddress?.ipv4 || attackData.target?.ip,
+                attack_type: attackData.signatures?.[0]?.name || attackData.type,
+                start_time: new Date(attackData.startedAt),
+                end_time: attackData.endedAt ? new Date(attackData.endedAt) : null,
+                peak_bps: attackData.signatures?.[0]?.bpsPeak || attackData.peakBandwidth,
+                peak_pps: attackData.signatures?.[0]?.ppsPeak || attackData.peakPps,
+                duration: attackData.duration,
+                status: attackData.status || 'active',
+                raw_data: attackData,
+                created_at: new Date()
+            };
+
+            return await this.db.collection('attack_history').updateOne(
+                { attack_id: attackData.id },
+                { $set: attack },
+                { upsert: true }
+            );
+        } catch (error) {
+            logger.error('Error saving attack:', error);
+            throw error;
+        }
+    }
+
+    async getAttackHistory(ipAddress, limit = 10) {
+        try {
+            await this.ensureConnection();
+            return await this.db.collection('attack_history')
+                .find({ ip_address: ipAddress })
+                .sort({ start_time: -1 })
+                .limit(limit)
+                .toArray();
+        } catch (error) {
+            logger.error('Error getting attack history:', error);
+            return [];
+        }
+    }
+
+    async getAttackById(attackId) {
+        try {
+            await this.ensureConnection();
+            return await this.db.collection('attack_history').findOne({ attack_id: attackId });
+        } catch (error) {
+            logger.error('Error getting attack by ID:', error);
+            return null;
+        }
+    }
+
+    // Alert logs
+    async logAlert(guildId, channelId, ipAddress, attackId, messageId, alertType) {
+        try {
+            await this.ensureConnection();
+            const alert = {
+                guild_id: guildId,
+                channel_id: channelId,
+                ip_address: ipAddress,
+                attack_id: attackId,
+                message_id: messageId,
+                alert_type: alertType,
+                sent_at: new Date()
+            };
+
+            return await this.db.collection('alert_logs').insertOne(alert);
+        } catch (error) {
+            logger.error('Error logging alert:', error);
+            throw error;
+        }
+    }
+
+    async getAlertHistory(guildId, limit = 50) {
+        try {
+            await this.ensureConnection();
+            return await this.db.collection('alert_logs')
+                .find({ guild_id: guildId })
+                .sort({ sent_at: -1 })
+                .limit(limit)
+                .toArray();
+        } catch (error) {
+            logger.error('Error getting alert history:', error);
+            return [];
+        }
+    }
+
+    // User permissions
+    async getUserPermissions(guildId, userId) {
+        try {
+            await this.ensureConnection();
+            const userPerms = await this.db.collection('user_permissions').findOne({
+                guild_id: guildId,
+                user_id: userId
+            });
+            return userPerms?.permissions || [];
+        } catch (error) {
+            logger.error('Error getting user permissions:', error);
+            return [];
+        }
+    }
+
+    async setUserPermissions(guildId, userId, permissions, grantedBy) {
+        try {
+            await this.ensureConnection();
+            return await this.db.collection('user_permissions').updateOne(
+                { guild_id: guildId, user_id: userId },
+                {
+                    $set: {
+                        guild_id: guildId,
+                        user_id: userId,
+                        permissions: permissions,
+                        granted_by: grantedBy,
+                        granted_at: new Date()
+                    }
+                },
+                { upsert: true }
+            );
+        } catch (error) {
+            logger.error('Error setting user permissions:', error);
+            throw error;
+        }
+    }
+
+    // Cleanup and maintenance
+    async cleanupOldMetrics(daysToKeep = 30) {
+        try {
+            await this.ensureConnection();
+            const cutoffTime = new Date(Date.now() - (daysToKeep * 24 * 60 * 60 * 1000));
+            
+            const results = await Promise.all([
+                this.db.collection('bot_stats').deleteMany({ timestamp: { $lt: cutoffTime } }),
+                this.db.collection('api_usage').deleteMany({ timestamp: { $lt: cutoffTime } }),
+                this.db.collection('alert_logs').deleteMany({ sent_at: { $lt: cutoffTime } })
+            ]);
+            
+            const totalDeleted = results.reduce((sum, result) => sum + result.deletedCount, 0);
+            logger.info(`Cleaned up ${totalDeleted} old records`);
+            return totalDeleted;
+        } catch (error) {
+            logger.error('Error during cleanup:', error);
+            throw error;
+        }
+    }
+
+    async createBackup() {
+        try {
+            await this.ensureConnection();
+            const backupData = {
+                timestamp: new Date(),
+                database: this.dbName,
+                collections: {}
+            };
+
+            const collections = ['guilds', 'monitored_ips', 'attack_history', 'user_permissions'];
+            
+            for (const collectionName of collections) {
+                backupData.collections[collectionName] = await this.db.collection(collectionName).find({}).toArray();
+            }
+
+            const backupPath = `./backups/mongodb_backup_${Date.now()}.json`;
+            const fs = require('fs').promises;
+            const path = require('path');
+            
+            // Ensure backups directory exists
+            const backupDir = path.dirname(backupPath);
+            const fsSync = require('fs');
+            if (!fsSync.existsSync(backupDir)) {
+                fsSync.mkdirSync(backupDir, { recursive: true });
+            }
+            
+            await fs.writeFile(backupPath, JSON.stringify(backupData, null, 2));
+            
+            logger.info(`MongoDB backup created: ${backupPath}`);
+            return backupPath;
+        } catch (error) {
+            logger.error('Error creating backup:', error);
+            throw error;
+        }
+    }
+
+    async getTableSizes() {
+        try {
+            await this.ensureConnection();
+            const collections = ['guilds', 'monitored_ips', 'attack_history', 'alert_logs', 'user_permissions', 'api_usage', 'bot_stats'];
+            const sizes = {};
+            
+            for (const collectionName of collections) {
+                try {
+                    const count = await this.db.collection(collectionName).countDocuments();
+                    sizes[collectionName] = count;
+                } catch (error) {
+                    sizes[collectionName] = 0;
+                }
+            }
+            
+            return sizes;
+        } catch (error) {
+            logger.error('Error getting collection sizes:', error);
+            return {};
+        }
+    }
+
+    // Statistics for API
+    async getApiStats(hoursBack = 24) {
+        try {
+            await this.ensureConnection();
+            const cutoffTime = new Date(Date.now() - (hoursBack * 60 * 60 * 1000));
+            
+            const stats = await this.db.collection('api_usage')
+                .aggregate([
+                    { $match: { timestamp: { $gte: cutoffTime } } },
+                    {
+                        $group: {
+                            _id: '$endpoint',
+                            totalRequests: { $sum: 1 },
+                            errors: { $sum: { $cond: [{ $gte: ['$status_code', 400] }, 1, 0] } },
+                            avgResponseTime: { $avg: '$response_time' }
+                        }
+                    }
+                ])
+                .toArray();
+            
+            return stats;
+        } catch (error) {
+            logger.error('Error getting API stats:', error);
+            return [];
+        }
+    }
+
+    // Additional compatibility methods for stats
+    async getSummaryStats() {
+        try {
+            await this.ensureConnection();
+            const now = new Date();
+            const last24h = new Date(now.getTime() - 24 * 60 * 60 * 1000);
+            
+            const [
+                totalRequests,
+                totalErrors,
+                recentAlerts,
+                activeMonitors
+            ] = await Promise.all([
+                this.db.collection('api_usage').countDocuments({ timestamp: { $gte: last24h } }),
+                this.db.collection('api_usage').countDocuments({ 
+                    timestamp: { $gte: last24h },
+                    status_code: { $gte: 400 }
+                }),
+                this.db.collection('alert_logs').countDocuments({ sent_at: { $gte: last24h } }),
+                this.db.collection('monitored_ips').countDocuments({ is_active: true })
+            ]);
+
+            return {
+                totalRequests,
+                totalErrors,
+                recentAlerts,
+                activeMonitors,
+                successRate: totalRequests > 0 ? ((totalRequests - totalErrors) / totalRequests * 100).toFixed(1) : 100
+            };
+        } catch (error) {
+            logger.error('Error getting summary stats:', error);
+            return {
+                totalRequests: 0,
+                totalErrors: 0,
+                recentAlerts: 0,
+                activeMonitors: 0,
+                successRate: 100
+            };
+        }
     }
 }
 
-module.exports = new DatabaseManager();
+module.exports = new MongoDatabase();

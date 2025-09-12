@@ -12,7 +12,7 @@ class Config {
             token: process.env.DISCORD_BOT_TOKEN,
             clientId: process.env.DISCORD_CLIENT_ID,
             guildId: process.env.DISCORD_GUILD_ID,
-            applicationId: process.env.DISCORD_CLIENT_ID // Add this for proper command deployment
+            applicationId: process.env.DISCORD_CLIENT_ID
         };
     }
 
@@ -27,20 +27,30 @@ class Config {
         };
     }
 
-    // Database Configuration
+    // MongoDB Configuration
     get database() {
         return {
-            path: process.env.DATABASE_PATH || './database/neoprotect.db',
-            backupPath: process.env.DATABASE_BACKUP_PATH || './backups',
-            maxConnections: parseInt(process.env.DB_MAX_CONNECTIONS) || 10,
-            busyTimeout: parseInt(process.env.DB_BUSY_TIMEOUT) || 30000,
-            pragma: {
-                journal_mode: 'WAL',
-                synchronous: 'NORMAL',
-                cache_size: -16000, // 16MB cache
-                temp_store: 'MEMORY',
-                mmap_size: 268435456 // 256MB mmap
-            }
+            type: 'mongodb',
+            host: process.env.MONGODB_HOST || 'localhost',
+            port: parseInt(process.env.MONGODB_PORT) || 27017,
+            database: process.env.MONGODB_DATABASE || 'neoprotect_bot',
+            username: process.env.MONGODB_USERNAME,
+            password: process.env.MONGODB_PASSWORD,
+            authSource: process.env.MONGODB_AUTH_SOURCE || 'admin',
+            maxPoolSize: parseInt(process.env.MONGODB_MAX_POOL_SIZE) || 10,
+            timeout: parseInt(process.env.MONGODB_TIMEOUT) || 5000,
+            socketTimeout: parseInt(process.env.MONGODB_SOCKET_TIMEOUT) || 45000,
+            // SSL/TLS options
+            ssl: this.parseBoolean(process.env.MONGODB_SSL, false),
+            sslValidate: this.parseBoolean(process.env.MONGODB_SSL_VALIDATE, true),
+            sslCA: process.env.MONGODB_SSL_CA,
+            sslKey: process.env.MONGODB_SSL_KEY,
+            sslCert: process.env.MONGODB_SSL_CERT,
+            // Replica Set options
+            replicaSet: process.env.MONGODB_REPLICA_SET,
+            readPreference: process.env.MONGODB_READ_PREFERENCE || 'primary',
+            // Connection string override (for Atlas, etc.)
+            connectionString: process.env.MONGODB_CONNECTION_STRING
         };
     }
 
@@ -52,7 +62,7 @@ class Config {
             alertCooldown: parseInt(process.env.ALERT_COOLDOWN) || 300000,
             maxConcurrentChecks: parseInt(process.env.MAX_CONCURRENT_CHECKS) || 5,
             healthCheckInterval: parseInt(process.env.HEALTH_CHECK_INTERVAL) || 60000,
-            cleanupInterval: parseInt(process.env.CLEANUP_INTERVAL) || 3600000 // 1 hour
+            cleanupInterval: parseInt(process.env.CLEANUP_INTERVAL) || 3600000
         };
     }
 
@@ -63,7 +73,7 @@ class Config {
             rateLimitWindow: parseInt(process.env.RATE_LIMIT_WINDOW) || 60000,
             rateLimitMaxRequests: parseInt(process.env.RATE_LIMIT_MAX_REQUESTS) || 10,
             maxApiKeysPerUser: parseInt(process.env.MAX_API_KEYS_PER_USER) || 3,
-            tokenExpiration: parseInt(process.env.TOKEN_EXPIRATION) || 86400000 // 24 hours
+            tokenExpiration: parseInt(process.env.TOKEN_EXPIRATION) || 86400000
         };
     }
 
@@ -71,14 +81,25 @@ class Config {
     get logging() {
         return {
             level: process.env.LOG_LEVEL || (this.isProduction ? 'info' : 'debug'),
-            maxSize: parseInt(process.env.LOG_FILE_MAX_SIZE) || 10485760, // 10MB
+            maxSize: parseInt(process.env.LOG_FILE_MAX_SIZE) || 10485760,
             maxFiles: parseInt(process.env.LOG_MAX_FILES) || 5,
             datePattern: process.env.LOG_DATE_PATTERN || 'YYYY-MM-DD',
             dir: process.env.LOG_DIR || './logs',
-            format: {
-                timestamp: true,
-                colorize: !this.isProduction,
-                prettyPrint: !this.isProduction
+            console: {
+                enabled: this.parseBoolean(process.env.LOG_CONSOLE_ENABLED, true),
+                colorize: this.parseBoolean(process.env.LOG_CONSOLE_COLORIZE, !this.isProduction),
+                timestamp: this.parseBoolean(process.env.LOG_CONSOLE_TIMESTAMP, true)
+            },
+            file: {
+                enabled: this.parseBoolean(process.env.LOG_FILE_ENABLED, true),
+                maxSize: parseInt(process.env.LOG_FILE_MAX_SIZE) || 10485760,
+                maxFiles: parseInt(process.env.LOG_MAX_FILES) || 5
+            },
+            // MongoDB logging (optional)
+            mongodb: {
+                enabled: this.parseBoolean(process.env.LOG_MONGODB_ENABLED, false),
+                collection: process.env.LOG_MONGODB_COLLECTION || 'logs',
+                level: process.env.LOG_MONGODB_LEVEL || 'error'
             }
         };
     }
@@ -91,7 +112,9 @@ class Config {
             premiumFeatures: this.parseBoolean(process.env.ENABLE_PREMIUM_FEATURES, false),
             webDashboard: this.parseBoolean(process.env.WEB_ENABLED, false),
             notifications: this.parseBoolean(process.env.ENABLE_NOTIFICATIONS, true),
-            healthChecks: this.parseBoolean(process.env.ENABLE_HEALTH_CHECKS, true)
+            healthChecks: this.parseBoolean(process.env.ENABLE_HEALTH_CHECKS, true),
+            clustering: this.parseBoolean(process.env.ENABLE_CLUSTERING, false),
+            caching: this.parseBoolean(process.env.ENABLE_CACHING, true)
         };
     }
 
@@ -119,7 +142,15 @@ class Config {
             ttl: parseInt(process.env.CACHE_TTL) || 300000, // 5 minutes
             maxSize: parseInt(process.env.CACHE_MAX_SIZE) || 1000,
             checkPeriod: parseInt(process.env.CACHE_CHECK_PERIOD) || 600000, // 10 minutes
-            enabled: this.parseBoolean(process.env.CACHE_ENABLED, true)
+            enabled: this.parseBoolean(process.env.CACHE_ENABLED, true),
+            // Redis configuration (optional)
+            redis: {
+                enabled: this.parseBoolean(process.env.REDIS_ENABLED, false),
+                host: process.env.REDIS_HOST || 'localhost',
+                port: parseInt(process.env.REDIS_PORT) || 6379,
+                password: process.env.REDIS_PASSWORD,
+                db: parseInt(process.env.REDIS_DB) || 0
+            }
         };
     }
 
@@ -218,6 +249,14 @@ class Config {
             throw new Error('NeoProtect API key appears to be too short');
         }
 
+        // Validate MongoDB configuration if using custom connection
+        if (process.env.MONGODB_CONNECTION_STRING) {
+            if (!process.env.MONGODB_CONNECTION_STRING.startsWith('mongodb://') && 
+                !process.env.MONGODB_CONNECTION_STRING.startsWith('mongodb+srv://')) {
+                throw new Error('Invalid MongoDB connection string format');
+            }
+        }
+
         console.log('✅ Environment validation passed');
     }
 
@@ -256,10 +295,36 @@ class Config {
         return process.env.NODE_ENV || 'development';
     }
 
+    // Get MongoDB connection string
+    getMongoConnectionString() {
+        // Use custom connection string if provided (for Atlas, etc.)
+        if (this.database.connectionString) {
+            return this.database.connectionString;
+        }
+
+        // Build connection string from parts
+        const { host, port, username, password, authSource } = this.database;
+        
+        if (username && password) {
+            return `mongodb://${username}:${password}@${host}:${port}/?authSource=${authSource}`;
+        }
+        
+        return `mongodb://${host}:${port}`;
+    }
+
     // Get configuration summary for debugging
     getConfigSummary() {
         return {
             environment: this.nodeEnv,
+            database: {
+                type: this.database.type,
+                host: this.database.host,
+                port: this.database.port,
+                database: this.database.database,
+                hasAuth: !!(this.database.username && this.database.password),
+                ssl: this.database.ssl,
+                replicaSet: this.database.replicaSet
+            },
             features: Object.keys(this.features).filter(key => this.features[key]),
             monitoring: {
                 interval: this.monitoring.interval,
@@ -274,6 +339,14 @@ class Config {
                 rateLimitEnabled: this.security.rateLimitMaxRequests > 0
             }
         };
+    }
+
+    // Database migration helper
+    shouldMigrate() {
+        // Check if we should migrate from SQLite to MongoDB
+        const fs = require('fs');
+        const sqlitePath = './database/neoprotect.db';
+        return fs.existsSync(sqlitePath) && this.database.type === 'mongodb';
     }
 }
 

@@ -1,14 +1,101 @@
 const { Client, GatewayIntentBits, Partials, ActivityType } = require('discord.js');
-const config = require('../config');
-const logger = require('./utils/logger');
-const database = require('./utils/database');
-const neoprotect = require('./utils/neoprotect');
-const CommandHandler = require('./handlers/commandHandler');
-const EventHandler = require('./handlers/eventHandler');
-const MonitoringSystem = require('./utils/monitor');
+
+// Add debug logging for each step
+console.log('🔍 Step 1: Loading dependencies...');
+
+let config, logger, database, neoprotect, CommandHandler, EventHandler, MonitoringSystem;
+
+try {
+    config = require('../config');
+    console.log('✅ Config loaded successfully');
+} catch (error) {
+    console.error('❌ Failed to load config:', error.message);
+    process.exit(1);
+}
+
+try {
+    logger = require('./utils/logger');
+    console.log('✅ Logger loaded successfully');
+} catch (error) {
+    console.error('❌ Failed to load logger:', error.message);
+    process.exit(1);
+}
+
+try {
+    database = require('./utils/database');
+    console.log('✅ Database module loaded successfully');
+} catch (error) {
+    console.error('❌ Failed to load database:', error.message);
+    process.exit(1);
+}
+
+try {
+    neoprotect = require('./utils/neoprotect');
+    console.log('✅ NeoProtect module loaded successfully');
+} catch (error) {
+    console.error('❌ Failed to load neoprotect:', error.message);
+    process.exit(1);
+}
+
+try {
+    CommandHandler = require('./handlers/commandHandler');
+    console.log('✅ CommandHandler loaded successfully');
+} catch (error) {
+    console.error('❌ Failed to load CommandHandler:', error.message);
+    console.error('Creating minimal command handler...');
+    CommandHandler = class MinimalCommandHandler {
+        constructor(client) {
+            this.client = client;
+            this.commands = new Map();
+        }
+        async handleInteraction(interaction) {
+            console.log('Command interaction received:', interaction.commandName);
+        }
+    };
+}
+
+try {
+    EventHandler = require('./handlers/eventHandler');
+    console.log('✅ EventHandler loaded successfully');
+} catch (error) {
+    console.error('❌ Failed to load EventHandler:', error.message);
+    console.error('Creating minimal event handler...');
+    EventHandler = class MinimalEventHandler {
+        constructor(client) {
+            this.client = client;
+        }
+    };
+}
+
+try {
+    MonitoringSystem = require('./utils/monitor');
+    console.log('✅ MonitoringSystem loaded successfully');
+} catch (error) {
+    console.error('❌ Failed to load MonitoringSystem:', error.message);
+    console.error('Creating minimal monitoring system...');
+    MonitoringSystem = class MinimalMonitoringSystem {
+        constructor(client) {
+            this.client = client;
+            this.isRunning = false;
+        }
+        start() {
+            this.isRunning = true;
+            console.log('Minimal monitoring system started');
+        }
+        stop() {
+            this.isRunning = false;
+        }
+        getSystemStats() {
+            return { isRunning: this.isRunning };
+        }
+    };
+}
+
+console.log('🔍 Step 2: All modules loaded, creating bot class...');
 
 class NeoProtectBot {
     constructor() {
+        console.log('🔍 Step 3: Bot constructor called');
         this.client = null;
         this.commandHandler = null;
         this.eventHandler = null;
@@ -18,34 +105,70 @@ class NeoProtectBot {
         
         // Graceful shutdown handling
         this.setupGracefulShutdown();
+        console.log('✅ Bot constructor completed');
+    }
+
+    setupGracefulShutdown() {
+        console.log('🔍 Setting up graceful shutdown handlers...');
+        
+        process.on('SIGINT', async () => {
+            console.log('\n🛑 Received SIGINT, shutting down gracefully...');
+            await this.shutdown();
+            process.exit(0);
+        });
+
+        process.on('SIGTERM', async () => {
+            console.log('\n🛑 Received SIGTERM, shutting down gracefully...');
+            await this.shutdown();
+            process.exit(0);
+        });
+
+        process.on('uncaughtException', (error) => {
+            console.error('💥 Uncaught Exception:', error);
+            process.exit(1);
+        });
+
+        process.on('unhandledRejection', (reason, promise) => {
+            console.error('💥 Unhandled Rejection at:', promise, 'reason:', reason);
+            process.exit(1);
+        });
+        
+        console.log('✅ Graceful shutdown handlers set up');
     }
 
     async start() {
         try {
+            console.log('🔍 Step 4: Starting bot initialization...');
             logger.startup('Starting NeoProtect Discord Bot...');
             
             // Initialize Discord client
+            console.log('🔍 Step 5: Initializing Discord client...');
             await this.initializeClient();
             
             // Initialize handlers
+            console.log('🔍 Step 6: Initializing handlers...');
             await this.initializeHandlers();
             
             // Initialize monitoring system
+            console.log('🔍 Step 7: Initializing monitoring...');
             await this.initializeMonitoring();
             
             // Login to Discord
+            console.log('🔍 Step 8: Logging in to Discord...');
             await this.login();
             
+            console.log('✅ Bot initialization completed successfully');
             logger.startup('Bot initialization completed successfully');
             
         } catch (error) {
+            console.error('💥 Failed to start bot:', error);
             logger.error('Failed to start bot', error);
             process.exit(1);
         }
     }
 
     async initializeClient() {
-        logger.info('Initializing Discord client...');
+        console.log('🔍 Creating Discord client with intents...');
         
         this.client = new Client({
             intents: [
@@ -65,307 +188,144 @@ class NeoProtectBot {
             }
         });
 
+        console.log('🔍 Setting up client event handlers...');
+
         // Set up basic error handling
         this.client.on('error', (error) => {
+            console.error('Discord client error:', error);
             logger.error('Discord client error', error);
         });
 
         this.client.on('warn', (warning) => {
+            console.warn('Discord client warning:', warning);
             logger.warn(`Discord client warning: ${warning}`);
         });
 
         this.client.on('rateLimit', (rateLimitData) => {
+            console.warn('Rate limit encountered:', rateLimitData);
             logger.warn('Rate limit encountered', rateLimitData);
         });
 
         // Ready event
         this.client.once('ready', async () => {
+            console.log('🔍 Discord client ready event fired');
             await this.onReady();
         });
 
-        logger.info('Discord client initialized');
+        console.log('✅ Discord client initialized');
     }
 
     async initializeHandlers() {
-        logger.info('Initializing command and event handlers...');
-        
-        // Initialize command handler
+        console.log('🔍 Initializing command handler...');
         this.commandHandler = new CommandHandler(this.client);
         
-        // Initialize event handler
+        console.log('🔍 Initializing event handler...');
         this.eventHandler = new EventHandler(this.client);
         
-        // Set up interaction handling
+        console.log('🔍 Setting up interaction handling...');
         this.client.on('interactionCreate', async (interaction) => {
+            console.log('Interaction received:', interaction.type);
             await this.commandHandler.handleInteraction(interaction);
         });
         
-        logger.info('Handlers initialized');
+        console.log('✅ Handlers initialized');
     }
 
     async initializeMonitoring() {
-        logger.info('Initializing monitoring system...');
-        
+        console.log('🔍 Creating monitoring system...');
         this.monitoringSystem = new MonitoringSystem(this.client);
         
-        // Store reference for global access
+        console.log('🔍 Setting up client references...');
         this.client.monitoring = this.monitoringSystem;
         this.client.neoprotect = neoprotect;
         this.client.database = database;
         
-        logger.info('Monitoring system initialized');
+        console.log('✅ Monitoring system initialized');
     }
 
     async login() {
-        logger.info('Logging in to Discord...');
+        console.log('🔍 Attempting Discord login...');
+        
+        if (!config.discord || !config.discord.token) {
+            throw new Error('Discord token not found in config');
+        }
+        
+        console.log('🔍 Token exists, logging in...');
         await this.client.login(config.discord.token);
+        console.log('✅ Discord login successful');
     }
 
     async onReady() {
+        console.log('🔍 Bot ready event handler called');
         this.isReady = true;
         const readyTime = Date.now() - this.startTime;
+        
+        console.log(`🎉 Bot is ready! Logged in as ${this.client.user.tag}`);
+        console.log(`⚡ Ready in ${readyTime}ms`);
         
         logger.startup(`Bot is ready! Logged in as ${this.client.user.tag}`);
         logger.startup(`Ready in ${readyTime}ms`);
         
         // Set bot activity
+        console.log('🔍 Setting bot activity...');
         await this.setActivity();
         
         // Start monitoring system
-        this.monitoringSystem.start();
-        
-        // Deploy slash commands if in development
-        if (config.isDevelopment) {
-            await this.deployCommands();
+        console.log('🔍 Starting monitoring system...');
+        try {
+            this.monitoringSystem.start();
+            console.log('✅ Monitoring system started');
+        } catch (error) {
+            console.error('⚠️ Failed to start monitoring system:', error.message);
         }
         
-        // Log bot statistics
-        await this.logBotStats();
-        
-        // Set up periodic status updates
-        setInterval(async () => {
-            await this.updateActivity();
-            await this.logBotStats();
-        }, 300000); // Every 5 minutes
-        
+        console.log('🎉 Bot is fully operational!');
         logger.startup('Bot is fully operational');
+        
+        // Keep the process alive
+        console.log('🔍 Bot startup complete, waiting for events...');
     }
 
     async setActivity() {
-        const monitorCount = (await database.all('SELECT COUNT(*) as count FROM monitored_ips WHERE is_active = TRUE'))[0].count;
+        try {
+            await this.client.user.setActivity({
+                name: 'DDoS Protection | /help',
+                type: ActivityType.Watching
+            });
+            console.log('✅ Bot activity set');
+        } catch (error) {
+            console.error('⚠️ Failed to set activity:', error.message);
+        }
+    }
+
+    async shutdown() {
+        console.log('🔍 Starting graceful shutdown...');
         
-        await this.client.user.setActivity({
-            name: `${monitorCount} IPs | /help`,
-            type: ActivityType.Watching
-        });
-    }
-
-    async updateActivity() {
         try {
-            await this.setActivity();
-        } catch (error) {
-            logger.error('Failed to update activity', error);
-        }
-    }
-
-    async deployCommands() {
-        try {
-            logger.info('Deploying slash commands...');
-            
-            const commands = [];
-            for (const [name, command] of this.commandHandler.commands) {
-                commands.push(command.data.toJSON());
-            }
-
-            // Deploy to test guild if specified, otherwise globally
-            if (config.discord.guildId) {
-                const guild = await this.client.guilds.fetch(config.discord.guildId);
-                await guild.commands.set(commands);
-                logger.info(`Deployed ${commands.length} commands to test guild`);
-            } else {
-                await this.client.application.commands.set(commands);
-                logger.info(`Deployed ${commands.length} commands globally`);
+            if (this.monitoringSystem) {
+                console.log('🔍 Stopping monitoring system...');
+                this.monitoringSystem.stop();
             }
             
-        } catch (error) {
-            logger.error('Failed to deploy commands', error);
-        }
-    }
-
-    async logBotStats() {
-        try {
-            const stats = {
-                guilds: this.client.guilds.cache.size,
-                users: this.client.users.cache.size,
-                channels: this.client.channels.cache.size,
-                uptime: process.uptime(),
-                memoryUsage: process.memoryUsage().heapUsed / 1024 / 1024, // MB
-                ping: this.client.ws.ping
-            };
-
-            // Record metrics
-            await database.recordMetric('guild_count', stats.guilds);
-            await database.recordMetric('user_count', stats.users);
-            await database.recordMetric('memory_usage', stats.memoryUsage);
-            await database.recordMetric('bot_ping', stats.ping);
-
-            // Log performance warning if needed
-            if (stats.memoryUsage > config.performance.memoryThreshold) {
-                logger.warn(`High memory usage: ${stats.memoryUsage.toFixed(2)}MB`);
+            if (this.client) {
+                console.log('🔍 Destroying Discord client...');
+                this.client.destroy();
             }
-
-            logger.debug('Bot statistics recorded', stats);
             
+            console.log('✅ Graceful shutdown completed');
         } catch (error) {
-            logger.error('Failed to log bot stats', error);
+            console.error('❌ Error during shutdown:', error);
         }
-    }
-
-    async setupGracefulShutdown() {
-        const shutdown = async (signal) => {
-            logger.shutdown(`Received ${signal}, shutting down gracefully...`);
-            
-            try {
-                // Stop monitoring system
-                if (this.monitoringSystem) {
-                    await this.monitoringSystem.shutdown();
-                }
-                
-                // Close database connection
-                if (database) {
-                    await database.close();
-                }
-                
-                // Destroy Discord client
-                if (this.client) {
-                    this.client.destroy();
-                }
-                
-                logger.shutdown('Graceful shutdown completed');
-                process.exit(0);
-                
-            } catch (error) {
-                logger.shutdown('Error during shutdown', error);
-                process.exit(1);
-            }
-        };
-
-        // Handle various shutdown signals
-        process.on('SIGINT', () => shutdown('SIGINT'));
-        process.on('SIGTERM', () => shutdown('SIGTERM'));
-        process.on('SIGUSR2', () => shutdown('SIGUSR2')); // nodemon restart
-        
-        // Handle uncaught exceptions
-        process.on('uncaughtException', (error) => {
-            logger.error('Uncaught exception', error);
-            shutdown('uncaughtException');
-        });
-        
-        process.on('unhandledRejection', (reason, promise) => {
-            logger.error('Unhandled rejection', reason);
-            shutdown('unhandledRejection');
-        });
-    }
-
-    // Utility methods for external access
-    getStats() {
-        return {
-            isReady: this.isReady,
-            uptime: Date.now() - this.startTime,
-            guilds: this.client?.guilds.cache.size || 0,
-            users: this.client?.users.cache.size || 0,
-            channels: this.client?.channels.cache.size || 0,
-            ping: this.client?.ws.ping || 0,
-            memoryUsage: process.memoryUsage().heapUsed / 1024 / 1024,
-            commands: this.commandHandler?.getCommandStats() || {},
-            events: this.eventHandler?.getEventStats() || {},
-            monitoring: this.monitoringSystem?.getSystemStats() || {}
-        };
-    }
-
-    async getHealthCheck() {
-        const health = {
-            status: 'healthy',
-            timestamp: new Date().toISOString(),
-            uptime: Date.now() - this.startTime,
-            services: {}
-        };
-
-        try {
-            // Check Discord connection
-            health.services.discord = {
-                status: this.client?.ws.status === 0 ? 'healthy' : 'unhealthy',
-                ping: this.client?.ws.ping || 0
-            };
-
-            // Check database
-            try {
-                await database.get('SELECT 1');
-                health.services.database = { status: 'healthy' };
-            } catch (error) {
-                health.services.database = { status: 'unhealthy', error: error.message };
-                health.status = 'degraded';
-            }
-
-            // Check NeoProtect API
-            const neoHealth = neoprotect.getHealthStatus();
-            health.services.neoprotect = {
-                status: neoHealth.isHealthy ? 'healthy' : 'unhealthy',
-                lastCheck: neoHealth.lastHealthCheck
-            };
-
-            if (!neoHealth.isHealthy) {
-                health.status = 'degraded';
-            }
-
-            // Check monitoring system
-            const monitoringStats = this.monitoringSystem?.getSystemStats();
-            health.services.monitoring = {
-                status: monitoringStats?.isRunning ? 'healthy' : 'unhealthy',
-                alertQueue: monitoringStats?.alertQueue || 0
-            };
-
-            if (!monitoringStats?.isRunning) {
-                health.status = 'degraded';
-            }
-
-        } catch (error) {
-            health.status = 'unhealthy';
-            health.error = error.message;
-        }
-
-        return health;
-    }
-
-    // Reload methods for hot-reloading
-    async reloadCommands() {
-        if (this.commandHandler) {
-            this.commandHandler.reloadAllCommands();
-            await this.deployCommands();
-            return true;
-        }
-        return false;
-    }
-
-    async reloadEvents() {
-        if (this.eventHandler) {
-            this.eventHandler.reloadAllEvents();
-            return true;
-        }
-        return false;
     }
 }
 
-// Initialize and start the bot
+console.log('🔍 Step 9: Creating bot instance...');
 const bot = new NeoProtectBot();
 
-// Export for external access (useful for web dashboard)
-module.exports = bot;
+console.log('🔍 Step 10: Starting bot...');
+bot.start().catch(error => {
+    console.error('💥 Bot failed to start:', error);
+    process.exit(1);
+});
 
-// Start the bot if this file is run directly
-if (require.main === module) {
-    bot.start().catch(error => {
-        logger.error('Failed to start bot', error);
-        process.exit(1);
-    });
-}
+console.log('🔍 Step 11: Bot start command issued, waiting for completion...');
